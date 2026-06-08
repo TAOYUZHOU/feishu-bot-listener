@@ -1,0 +1,16 @@
+[Unit]
+Description=Feishu CLI bot message listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/lark-bot/listener.env
+ExecStart=%h/.local/bin/lark-feishu-listener
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
