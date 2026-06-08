@@ -63,6 +63,7 @@ Test in Feishu: open a **private chat** with your CLI bot and send `ping`.
 | `help` | List commands |
 | `status` | Host uptime, load, disk |
 | `run df -h` | Run shell on server (timeout limited) |
+| *任意其他文字* | 交给 Cursor Agent 只读问答（先回「正在思考…」） |
 
 ## Two machines, two bots
 
