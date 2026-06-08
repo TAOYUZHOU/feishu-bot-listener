@@ -1,0 +1,14 @@
+# Local secrets and runtime config
+config/listener.env
+*.env
+!*.env.example
+
+# Logs
+*.log
+.local/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
