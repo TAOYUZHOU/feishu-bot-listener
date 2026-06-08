@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -17,6 +18,11 @@ LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
 HOST_LABEL = os.environ.get("HOST_LABEL", platform.node())
 ALLOWED_SENDER = os.environ.get("ALLOWED_SENDER", "")
 RUN_TIMEOUT_SEC = int(os.environ.get("RUN_TIMEOUT_SEC", "120"))
+AGENT_CMD = os.environ.get("AGENT_CMD", "agent")
+AGENT_CWD = os.environ.get("AGENT_CWD", str(Path.home() / "AIchemengine_v3"))
+AGENT_MODE = os.environ.get("AGENT_MODE", "ask")
+AGENT_TIMEOUT_SEC = int(os.environ.get("AGENT_TIMEOUT_SEC", "300"))
+AGENT_ENABLED = os.environ.get("AGENT_ENABLED", "1").lower() not in {"0", "false", "no"}
 LOG_DIR = Path(os.environ.get("LARK_BOT_LOG_DIR", Path.home() / ".local/log/lark-bot"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "listener.log"
@@ -25,6 +31,7 @@ MAX_REPLY_CHARS = 3800
 _seen_event_ids: dict[str, float] = {}
 _seen_lock = threading.Lock()
 _DEDUP_TTL_SEC = 3600
+_REPLY_PREFIX_RE = re.compile(r"^回复\s+[^:]+:\s*")
 
 
 def log(msg: str) -> None:
@@ -33,6 +40,19 @@ def log(msg: str) -> None:
     sys.stderr.flush()
     with LOG_FILE.open("a", encoding="utf-8") as fh:
         fh.write(line)
+
+
+def normalize_content(content: str) -> str:
+    """Strip Feishu reply headers like '回复 陶昱州:' from message text."""
+    lines = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = _REPLY_PREFIX_RE.sub("", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def prune_seen() -> None:
@@ -54,9 +74,14 @@ def is_duplicate(event_id: str) -> bool:
         return False
 
 
-def lark_reply(message_id: str, text: str) -> None:
+def clip_reply(text: str) -> str:
     if len(text) > MAX_REPLY_CHARS:
-        text = text[: MAX_REPLY_CHARS - 20] + "\n...(truncated)"
+        return text[: MAX_REPLY_CHARS - 20] + "\n...(truncated)"
+    return text
+
+
+def lark_reply(message_id: str, text: str) -> None:
+    text = clip_reply(text)
     result = subprocess.run(
         [
             LARK_CLI,
@@ -75,6 +100,28 @@ def lark_reply(message_id: str, text: str) -> None:
     )
     if result.returncode != 0:
         log(f"reply failed message_id={message_id} stderr={result.stderr.strip()}")
+
+
+def lark_send(chat_id: str, text: str) -> None:
+    text = clip_reply(text)
+    result = subprocess.run(
+        [
+            LARK_CLI,
+            "im",
+            "+messages-send",
+            "--as",
+            "bot",
+            "--chat-id",
+            chat_id,
+            "--text",
+            text,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        log(f"send failed chat_id={chat_id} stderr={result.stderr.strip()}")
 
 
 def cmd_status() -> str:
@@ -108,7 +155,8 @@ def cmd_help() -> str:
         "ping — health check\n"
         "help — this message\n"
         "status — host uptime/load/disk\n"
-        "run <shell> — run command on this server (timeout configurable)\n"
+        "run <shell> — run command on this server\n"
+        "其他任意文字 — 交给 Cursor Agent 只读问答（查项目进展等）\n"
         "\n"
         "Tip: use a unique HOST_LABEL per machine when running multiple bots."
     )
@@ -139,27 +187,74 @@ def cmd_run(shell_cmd: str) -> str:
     return "\n".join(parts)
 
 
-def handle_message(content: str, message_id: str) -> None:
-    text = content.strip()
+def cmd_agent(question: str) -> str:
+    if not AGENT_ENABLED:
+        return f"[{HOST_LABEL}] Agent 未启用，请设置 AGENT_ENABLED=1"
+    if not Path(AGENT_CWD).is_dir():
+        return f"[{HOST_LABEL}] AGENT_CWD 不存在: {AGENT_CWD}"
+
+    prompt = (
+        f"{question}\n\n"
+        "请用中文简洁回答。若涉及本仓库项目进展，优先查阅文档、CSV 和 outputs 目录。"
+    )
+    log(f"agent question: {question!r} cwd={AGENT_CWD}")
+    try:
+        completed = subprocess.run(
+            [
+                AGENT_CMD,
+                "--print",
+                "--mode",
+                AGENT_MODE,
+                "--trust",
+                "--output-format",
+                "text",
+                prompt,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=AGENT_TIMEOUT_SEC,
+            cwd=AGENT_CWD,
+        )
+    except subprocess.TimeoutExpired:
+        return f"[{HOST_LABEL}] Agent 超时（>{AGENT_TIMEOUT_SEC}s），请缩小问题或稍后重试"
+    except FileNotFoundError:
+        return f"[{HOST_LABEL}] 找不到 Agent 命令: {AGENT_CMD}"
+
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "unknown error").strip()
+        return f"[{HOST_LABEL}] Agent 失败:\n{clip_reply(err)}"
+
+    answer = completed.stdout.strip() or "(empty response)"
+    return f"[{HOST_LABEL}]\n{answer}"
+
+
+def handle_agent_async(question: str, message_id: str, chat_id: str) -> None:
+    lark_reply(message_id, f"[{HOST_LABEL}] 正在思考，请稍候…")
+    reply = cmd_agent(question)
+    lark_send(chat_id, reply)
+
+
+def handle_message(content: str, message_id: str, chat_id: str) -> None:
+    text = normalize_content(content)
     if not text:
         return
 
     lower = text.lower()
     if lower == "ping":
-        reply = f"pong from {HOST_LABEL}"
+        lark_reply(message_id, f"pong from {HOST_LABEL}")
     elif lower == "help":
-        reply = cmd_help()
+        lark_reply(message_id, cmd_help())
     elif lower == "status":
-        reply = cmd_status()
+        lark_reply(message_id, cmd_status())
     elif lower.startswith("run "):
-        reply = cmd_run(text[4:].strip())
+        lark_reply(message_id, cmd_run(text[4:].strip()))
     else:
-        reply = (
-            f"[{HOST_LABEL}] 已收到: {text}\n"
-            "回复 help 查看可用命令。"
+        worker = threading.Thread(
+            target=handle_agent_async,
+            args=(text, message_id, chat_id),
+            daemon=True,
         )
-
-    lark_reply(message_id, reply)
+        worker.start()
 
 
 def wait_for_ready(stderr) -> None:
@@ -182,7 +277,9 @@ def main() -> int:
     )
 
     log(
-        f"starting listener host_label={HOST_LABEL} allowed_sender={ALLOWED_SENDER}"
+        "starting listener "
+        f"host_label={HOST_LABEL} allowed_sender={ALLOWED_SENDER} "
+        f"agent_enabled={AGENT_ENABLED} agent_cwd={AGENT_CWD}"
     )
 
     tail = subprocess.Popen(
@@ -238,14 +335,15 @@ def main() -> int:
             continue
 
         message_id = event.get("message_id") or event.get("id")
+        chat_id = event.get("chat_id", "")
         content = event.get("content", "")
-        if not message_id:
-            log(f"skip event without message_id: {event}")
+        if not message_id or not chat_id:
+            log(f"skip event missing ids: {event}")
             continue
 
         log(f"message message_id={message_id} content={content!r}")
         try:
-            handle_message(content, message_id)
+            handle_message(content, message_id, chat_id)
         except Exception as exc:  # noqa: BLE001
             log(f"handler error: {exc}")
             lark_reply(message_id, f"[{HOST_LABEL}] internal error: {exc}")
